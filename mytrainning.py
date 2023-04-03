@@ -97,26 +97,18 @@ def read_iamge(data_dir, fname, image_size=512):
     # 转化成np.array再返回
     return np.array(ImageOps.expand(img, padding).convert("RGB"))
 
-# 罚函数
-def L1_penalty(net, alpha):
-    loss = 0
-    for param in net.output.parameters():
-        loss += torch.sum(torch.abs(param))
-
-    return alpha*loss
-
-# 定义损失函数
+# define loss function
 # loss = nn.CrossEntropyLoss(reduction="none")
-loss = nn.L1Loss(reduction='sum')
+loss_fn = nn.L1Loss(reduction='sum')
 
 
 # 重写getitem函数，这样可以将这个类类似于DF
 class BAATrainDataset(Dataset):
     def __init__(self, df, file_path) -> None:
         def preprocess_df(df):
-            #nomalize boneage data_distribution，对选中的元素减去平均值，然后除以标准差，并将这个重新设置一个叫zscore的列
-            # df['zscore'] = df['boneage'].map(lambda x: (x - boneage_mean)/boneage_div )
-            #change the type of gender, change bool variable to float32，将性别和年龄转化为float32
+            # 3_4 nomalize boneage data_distribution
+            df['zscore'] = df['boneage'].map(lambda x: (x - boneage_mean)/boneage_div )
+            #change the type of gender, change bool variable to float32
             df['male'] = df['male'].astype('float32')
             df['bonage'] = df['boneage'].astype('float32')
             return df
@@ -127,7 +119,9 @@ class BAATrainDataset(Dataset):
     def __getitem__(self, index):
         row = self.df.iloc[index]
         num = int(row['id'])
-        return (transform_train(image=read_iamge(self.file_path, f"{num}.png"))['image'], Tensor([row['male']])), row['boneage']
+        # return (transform_train(image=read_iamge(self.file_path, f"{num}.png"))['image'], Tensor([row['male']])), row['boneage']
+        return (transform_train(image=read_iamge(self.file_path, f"{num}.png"))['image'], Tensor([row['male']])), row[
+            'zscore']
 
     def __len__(self):
         return len(self.df)
@@ -154,13 +148,22 @@ class BAAValDataset(Dataset):
 def create_data_loader(train_df, val_df, train_root, val_root):
     return BAATrainDataset(train_df, train_root), BAAValDataset(val_df, val_root)
 
-criterion = nn.CrossEntropyLoss(reduction='none')
+# criterion = nn.CrossEntropyLoss(reduction='none')
+# penalty function
+def L1_penalty(net, alpha):
+    loss = 0
+    for param in net.MLP.parameters():
+        loss += torch.sum(torch.abs(param))
+
+    return alpha*loss
+
 
 def accuracy(y_hat, y):
     if len(y_hat.shape) > 1 and y_hat.shape[1] > 1:
         y_hat = d2l.argmax(y_hat, axis=1)
     cmp = d2l.astype(y_hat, y.dtype) == y
     return float(d2l.reduce_sum(d2l.astype(cmp, y.dtype)))
+
 def evaluate_fn(data_iter, net, devices):
     net.eval()
     pred_list = torch.zeros((1, 230))
@@ -177,57 +180,45 @@ def evaluate_fn(data_iter, net, devices):
             grand_age = torch.cat([grand_age, label], dim=0)
     return feature_map, texture, gender_encode, accuracy(pred_list[1:, :], grand_age[1:])
 
-def accuracy(y_hat, y):
-    if len(y_hat.shape) > 1 and y_hat.shape[1] > 1:
-        y_hat = d2l.argmax(y_hat, axis=1)
-    cmp = d2l.astype(y_hat, y.dtype) == y
-    return float(d2l.reduce_sum(d2l.astype(cmp, y.dtype)))
-
-def map_fn(flags):
+def map_fn(net, train_dataset, valid_dataset, num_epochs, lr, wd, lr_period, lr_decay, batch_size=32):
+    """将训练函数和验证函数杂糅在一起的垃圾函数"""
+    # record outputs of every epoch
     record = [['epoch', 'training loss', 'val loss', 'acc']]
     with open('./RECORD.csv', 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         for row in record:
             writer.writerow(row)
     device = try_gpu()
-    # mymodel = BAA_New(32, *get_My_resnet50())
-    # mymodel = mymodel.to(device)
-    mymodel = myKit.get_net(isEnsemble=False)
-    mymodel = mymodel.to(device)
     # 数据读取
     # Creates dataloaders, which load data in batches
     # Note: test loader is not shuffled or sampled
     train_loader = torch.utils.data.DataLoader(
-        train_set,
-        batch_size=flags['batch_size'],
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
         drop_last=True)
 
     val_loader = torch.utils.data.DataLoader(
-        val_set,
-        batch_size=flags['batch_size'],
+        valid_dataset,
+        batch_size=batch_size,
         shuffle=False)
 
 
     ## Network, optimizer, and loss function creation
-    mymodel = mymodel.train()
+    net = net.to(device)
+    net = net.train()
 
-    global best_loss
-    best_loss = float('inf')
     #   loss_fn =  nn.MSELoss(reduction = 'sum')
-    loss_fn = nn.L1Loss(reduction='sum')
-    lr = flags['lr']
+    # loss_fn = nn.L1Loss(reduction='sum')
+    lr = lr
 
-    wd = 0
-
-    optimizer = torch.optim.Adam(mymodel.parameters(), lr=lr, weight_decay=wd)
-    #   optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay = wd)
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=wd)
     # 每过10轮，学习率降低一半
-    scheduler = StepLR(optimizer, step_size=2, gamma=0.8)
+    scheduler = StepLR(optimizer, step_size=lr_period, gamma=lr_decay)
 
     ## Trains
 
-    train_start = time.time()
-    for epoch in range(flags['num_epochs']):
+    for epoch in range(num_epochs):
         print(epoch)
         this_record = []
         global training_loss
@@ -246,8 +237,8 @@ def map_fn(flags):
         # 在不同的设备上运行该模型
 
         #   打开微调
-        mymodel.fine_tune()
-        #   enumerate（），为括号中序列构建索引
+        net.fine_tune()
+        #   enumerate()，为括号中序列构建索引
         for batch_idx, data in enumerate(train_loader):
             # #put data to GPU
             image, gender = data[0]
@@ -259,15 +250,17 @@ def map_fn(flags):
             # zero the parameter gradients，是参数梯度归0
             optimizer.zero_grad()
             # forward
-            _, _, _, _, _, _, _, y_pred = mymodel(image, gender)
-            # y_pred = y_pred.squeeze()
+            # _, _, _, _, _, _, _, y_pred = net(image, gender)
+            y_pred = net(image, gender)
+            y_pred = y_pred.squeeze()
 
             # print(y_pred, label)，求损失
-            # loss = loss_fn(y_pred, label)
-            loss = criterion(y_pred, label.long()).sum()
+            loss = loss_fn(y_pred, label)
+            # loss = criterion(y_pred, label.long()).sum()
             # backward,calculate gradients，反馈计算梯度
-            # total_loss = loss + L1_penalty(net, 1e-5)
-            loss.backward()
+            total_loss = loss + L1_penalty(net, 1e-5)
+            total_loss.backward()
+            # loss.backward()
             # backward,update parameter，更新参数
             optimizer.step()
 
@@ -279,8 +272,8 @@ def map_fn(flags):
 
         ## Evaluation
         # Sets net to eval and no grad context
-        mymodel.fine_tune(False)
-        pred_list = torch.zeros((1, 230))
+        net.fine_tune(False)
+        pred_list = torch.zeros((1,))
         grand_age = torch.zeros((1,))
         with torch.no_grad():
             # pred_list = []
@@ -294,19 +287,21 @@ def map_fn(flags):
                 label = data[1].type(torch.FloatTensor).to(device)
 
                 #   net内求出的是normalize后的数据，这里应该是是其还原，而不是直接net（）
-                _, _, _, _, _, _, _, y_pred = mymodel(image, gender)
-                # y_pred = y_pred * boneage_div + boneage_mean
-                y_pred_loss = y_pred.argmax(axis=1)
+                # _, _, _, _, _, _, _, y_pred = net(image, gender)
+                y_pred = net(image, gender)
+                y_pred = y_pred.cpu()
+                label = label.cpu()
+                y_pred = y_pred * boneage_div + boneage_mean
+                # y_pred_loss = y_pred.argmax(axis=1)
                 # y_pred = net(image, gender)
-                # y_pred = y_pred.squeeze()
+                y_pred = y_pred.squeeze()
 
-                batch_loss = F.l1_loss(y_pred_loss, label, reduction='sum').item()
+                batch_loss = F.l1_loss(y_pred, label, reduction='sum').item()
                 # print(batch_loss/len(data[1]))
                 mae_loss += batch_loss
                 # pred_list.extend(y_pred.detach().cpu())
                 # grand_age.extend(label)
-                y_pred = y_pred.cpu()
-                label = label.cpu()
+                # y_pred = y_pred.cpu()
                 pred_list = torch.cat([pred_list, y_pred], dim=0)
                 grand_age = torch.cat([grand_age, label], dim=0)
 
@@ -318,31 +313,38 @@ def map_fn(flags):
             # for pred0, grand_true in zip(pred_list, grand_age):
             #     print(f'{round(pred0.item(), 2)},   {round(grand_true.item(), 2)}')
             # print('------------------------------------------')
-        accuracy_num = accuracy(pred_list[1:, :], grand_age[1:])
+        cmp = d2l.astype(pred_list[1:], grand_age[1:].dtype) == grand_age[1:]
+        accuracy_num = float(d2l.reduce_sum(d2l.astype(cmp, grand_age[1:].dtype)))
+        # accuracy_num = accuracy(pred_list[1:, :], grand_age[1:])
         scheduler.step()
 
-        train_loss, val_mae, accuracy1= training_loss / total_size, mae_loss / val_total_size, accuracy_num / val_total_size
+        train_loss, val_mae, accuracy1 = training_loss / total_size, mae_loss / val_total_size, accuracy_num / val_total_size
         this_record.append([epoch, round(train_loss.item(), 2), round(val_mae.item(), 2), round(100*accuracy1.item(), 2)])
         with open('./RECORD.csv', 'a+', newline='') as csvfile:
             writer = csv.writer(csvfile)
             for row in this_record:
                 writer.writerow(row)
         print(
-            f'training loss is {round(train_loss.item(), 2)}, val loss is {round(val_mae.item(), 2)}, acuuracy is {round(100*accuracy1.item(), 2)} time : {round((time.time() - start_time), 2)}, lr:{optimizer.param_groups[0]["lr"]}')
-    torch.save(mymodel, './new_model.pth')
+            f'training loss is {round(train_loss.item(), 2)}, val loss is {round(val_mae.item(), 2)}, accuracy is {round(100*accuracy1.item(), 2)}% time : {round((time.time() - start_time), 2)}, lr:{optimizer.param_groups[0]["lr"]}')
+    torch.save(net, './model_3_4.pth')
 
 if __name__ == '__main__':
 
-    flags = {}
-    flags['lr'] = 1e-4
-    flags['batch_size'] = 8
-    flags['num_epochs'] = 50
+    net = myKit.get_net(isEnsemble=False)
+    lr = 1e-4
+    batch_size = 8
+    num_epochs = 50
+    weight_decay = 0
+    lr_period = 10
+    lr_decay = 0.5
 
-    train_df = pd.read_csv('../data/archive/small-dataset.csv')
-    val_df = pd.read_csv('../data/archive/valid-dataset.csv')
+    train_df = pd.read_csv('../data/archive/testDataset/train-dataset.csv')
+    # train_df = pd.read_csv('../data/archive/boneage-valid-dataset.csv')
+    val_df = pd.read_csv('../data/archive/testDataset/valid-dataset.csv')
     boneage_mean = train_df['boneage'].mean()
     boneage_div = train_df['boneage'].std()
-    train_set, val_set = create_data_loader(train_df, val_df, '../data/archive/small-dataset',
-                                            '../data/archive/valid-dataset')
+    train_set, val_set = create_data_loader(train_df, val_df, '../data/archive/testDataset/train-dataset',
+                                            '../data/archive/testDataset/valid-dataset')
     torch.set_default_tensor_type('torch.FloatTensor')
-    map_fn(flags=flags)
+
+    map_fn(net=net, train_dataset=train_set, valid_dataset=val_set, num_epochs=num_epochs, lr=lr, wd=weight_decay, lr_period=lr_period, lr_decay=lr_decay, batch_size=batch_size)
